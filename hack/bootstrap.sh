@@ -26,7 +26,9 @@ export CLUSTER_REGION=australia-southeast1
 
 # FluxCD configuration
 export DEFAULT_GITHUB_BRANCH=main
+export DEFAULT_GITHUB_OWNER=$(git remote get-url origin | awk -F'[/:@]' '{print $3}')
 export DEFAULT_GITHUB_REPO=k8s-gitops-atomic-clusters
+
 # GCP Tooling Service Accounts
 export KCC_SERVICE_ACCOUNT_NAME=kcc-sa
 export SOPS_SERVICE_ACCOUNT_NAME=sops-sa
@@ -41,13 +43,34 @@ fi
 
 gcloud config set project $GCP_PROJECT_ID
 
-# for service in "${required_services[@]}"; do
-#   if ! gcloud services list --enabled --filter="config.name=$service" --format="value(config.name)" | grep -q "$service"; then
-#     gcloud services enable "$service"
-#   else
-#     echo "$service is already enabled"
-#   fi
-# done
+# Enable required services if not already enabled
+required_services=(
+  servicemanagement.googleapis.com
+  servicecontrol.googleapis.com
+  cloudresourcemanager.googleapis.com
+  cloudkms.googleapis.com
+  compute.googleapis.com
+  container.googleapis.com
+  containerregistry.googleapis.com
+  cloudbuild.googleapis.com
+  gkeconnect.googleapis.com
+  gkehub.googleapis.com
+  iam.googleapis.com
+  mesh.googleapis.com
+  multiclusterservicediscovery.googleapis.com
+  multiclusteringress.googleapis.com
+  trafficdirector.googleapis.com
+  anthos.googleapis.com
+  dns.googleapis.com
+)
+
+for service in "${required_services[@]}"; do
+  if ! gcloud services list --enabled --filter="config.name=$service" --format="value(config.name)" | grep -q "$service"; then
+    gcloud services enable "$service"
+  else
+    echo "$service is already enabled"
+  fi
+done
 
 # Check and create KCC service account if it doesn't exist
 if ! gcloud iam service-accounts list --filter="email:${KCC_SERVICE_ACCOUNT_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com" | grep -q ${KCC_SERVICE_ACCOUNT_NAME}; then
@@ -86,62 +109,16 @@ if ! gcloud kms keys list --location global --keyring sops --format="value(name)
   gcloud kms keys list --location global --keyring sops
 fi
 
-# Setup Workload Identity for FluxCD and KCC
-# Bind FluxCD's kustomize-controller to the SOPS service account if not already bound
-if ! gcloud iam service-accounts get-iam-policy ${SOPS_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
-  --flatten="bindings[].members" \
-  --filter="bindings.members=serviceAccount:${PROJECT_ID}.svc.id.goog[flux-system/kustomize-controller]" \
-  --format="value(bindings.role)" | grep -q "roles/iam.workloadIdentityUser"; then
-  gcloud iam service-accounts add-iam-policy-binding \
-    ${SOPS_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
-    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[flux-system/kustomize-controller]" \
-    --role="roles/iam.workloadIdentityUser"
+
+# Setup the Management GKE cluster only if it doesn't exist
+if ! gcloud container clusters list --region=$CLUSTER_REGION --filter="name=$CLUSTER_NAME" --format="value(name)" | grep -q "$CLUSTER_NAME"; then
+  gcloud container clusters create-auto $CLUSTER_NAME \
+    --region $CLUSTER_REGION \
+    --project $GCP_PROJECT_ID \
+    --release-channel rapid
 else
-    echo "Workload identity binding for kustomize-controller already exists"
+  echo "Cluster $CLUSTER_NAME already exists"
 fi
-
-# Bind KCC's controller-manager to the KCC service account if not already bound
-if ! gcloud iam service-accounts get-iam-policy ${KCC_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
-  --flatten="bindings[].members" \
-  --filter="bindings.members=serviceAccount:${PROJECT_ID}.svc.id.goog[cnrm-system/cnrm-controller-manager]" \
-  --format="value(bindings.role)" | grep -q "roles/iam.workloadIdentityUser"; then
-  gcloud iam service-accounts add-iam-policy-binding \
-    ${KCC_SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
-    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[cnrm-system/cnrm-controller-manager]" \
-    --role="roles/iam.workloadIdentityUser"
-else
-    echo "Workload identity binding for cnrm-controller-manager already exists"
-fi
-
-NODEPOOL_NAME="np"
-ZONE="australia-southeast1-a"
-REGION="australia-southeast1"
-gcloud container clusters create $CLUSTER_NAME \
-    --cluster-version=$CLUSTER_VERSION \
-    --enable-dataplane-v2 \
-    --enable-ip-alias \
-    --network=$CLUSTER_VPC \
-    --subnetwork=$CLUSTER_SUBNET \
-    --node-locations=$ZONE \
-    --disk-size=50GB \
-    --total-max-nodes=4 \
-    --workload-pool=${PROJECT_ID}.svc.id.goog \
-    --workload-metadata=GKE_METADATA
-
-gcloud container node-pools delete default-pool \
-    --cluster=$CLUSTER_NAME \
-    --region=australia-southeast1 \
-    --quiet
-
-gcloud container node-pools create $NODEPOOL_NAME \
-    --cluster=$CLUSTER_NAME \
-    --region=$REGION \
-    --location-policy=BALANCED \
-    --enable-autoscaling \
-    --total-max-nodes=4 \
-    --machine-type=e2-standard-4 \
-    --spot
-
 
 # Setup Workload Identity for FluxCD and KCC
 # Bind FluxCD's kustomize-controller to the SOPS service account if not already bound
